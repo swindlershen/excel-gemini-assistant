@@ -25,6 +25,7 @@
           <h2>有什么可以帮你？</h2>
           <p>我可以读取整个工作簿、用真实公式建模、整理格式、生成图表。所有修改都可以一键撤销。</p>
           <div class="suggestions">
+            <button id="invoiceChip" class="chip invoice">🧾 扫描发票录入台账（选择图片 / PDF）</button>
             <button class="chip">总结这个工作簿的结构和关键数据</button>
             <button class="chip">解释选中单元格里的公式</button>
             <button class="chip">检查工作簿里的错误值并修复</button>
@@ -39,8 +40,11 @@
           <span id="selectionPill" class="pill" title="当前选区会自动作为上下文发送">选区：-</span>
           <span id="statusText" class="status"></span>
         </div>
+        <div id="attachStrip" class="attach-strip hidden"></div>
         <div class="input-row">
-          <textarea id="input" rows="1" placeholder="向 Gemini 提问或下达指令…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="attachBtn" class="attach-btn" title="添加发票 / 图片 / PDF（也可直接粘贴截图或拖入文件）">📎</button>
+          <input id="fileInput" type="file" accept="image/*,application/pdf" multiple class="hidden" />
+          <textarea id="input" rows="1" placeholder="向 Gemini 提问或下达指令…（Enter 发送，可粘贴截图 / 拖入发票）"></textarea>
           <button id="sendBtn" class="send-btn" title="发送">➤</button>
           <button id="stopBtn" class="send-btn stop hidden" title="停止">■</button>
         </div>

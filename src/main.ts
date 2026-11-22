@@ -14,6 +14,7 @@ import {
   selectAddress,
 } from "./tools";
 import { PRESET_MODELS, THINKING_LEVELS, Settings, loadSettings, saveSettings } from "./settings";
+import { Attachment, MAX_TOTAL_BYTES, fileToAttachment } from "./attachments";
 
 const MAX_STEPS = 40;
 
@@ -27,7 +28,21 @@ const SYSTEM_PROMPT = `你是嵌入在 Microsoft Excel 侧边栏中的 AI 助手
 5. 引用单元格时使用 工作表!地址 形式（例如 Sheet1!B2:D10），方便用户定位。
 6. 完成修改后，用简短列表总结改了哪些区域、做了什么。用户可以点击“撤销本轮修改”回滚。
 7. 用用户使用的语言回答（默认中文），简洁、专业，适当使用 Markdown 表格。
-8. 如果无法完成（例如缺少数据或 API 不支持），直接说明原因，不要编造结果。`;
+8. 如果无法完成（例如缺少数据或 API 不支持），直接说明原因，不要编造结果。
+
+发票 / 票据识别（用户上传图片或 PDF 时）：
+- 逐张仔细识别，看不清或缺失的字段留空并在“备注”列注明“需核对”，绝不臆造号码或金额。
+- 默认录入到名为“发票台账”的工作表：不存在就用 add_sheet 新建并写表头；已存在则先 read_range 读取表头和已有数据，按现有表头列顺序在最后一行之后追加，不要覆盖已有行。
+- 默认表头：序号, 发票类型, 发票代码, 发票号码, 开票日期, 购买方名称, 购买方税号, 销售方名称, 销售方税号, 项目名称, 金额(不含税), 税率, 税额, 价税合计, 校验, 来源文件, 备注
+  （全电发票没有发票代码则留空；项目名称多行时用“；”连接主要项目。）
+- 日期写成 yyyy-mm-dd；金额、税额写纯数字（不要带 ¥ 和逗号）；税率写成小数（如 0.13）并设置百分比格式；发票号码、税号、代码作为文本写入（在前面加英文单引号 ' 以保留前导零）。
+- “校验”列写公式核对 金额+税额=价税合计，例如 =IF(ABS(K2+M2-N2)<0.01,"✓","需核对")（按实际列调整）。
+- 录入前检查发票号码是否已存在于台账中，重复的不要再录入，并在回复中说明。
+- 首次建表时给表头加粗加底色、金额列设置 #,##0.00 格式、自动调整列宽。
+- 完成后用表格简要列出本次录入的发票（号码、销售方、价税合计）和需要人工核对的项。
+- 用户要求明细时，另建“发票明细”工作表，每个商品/服务一行，并带上发票号码关联。`;
+
+const INVOICE_PROMPT = "请识别附件中的发票，按规则录入“发票台账”工作表。";
 
 /* ------------------------------ state ------------------------------ */
 
@@ -199,12 +214,71 @@ async function refreshSelectionPill() {
 
 /* -------------------------------- UI -------------------------------- */
 
-function addUserMessage(text: string) {
+function attachmentChip(a: Attachment): HTMLElement {
+  const chip = el("div", "att");
+  if (a.previewUrl) {
+    const img = el("img");
+    img.src = a.previewUrl;
+    chip.appendChild(img);
+  } else {
+    chip.appendChild(el("span", "att-icon", a.mimeType === "application/pdf" ? "PDF" : "IMG"));
+  }
+  chip.appendChild(el("span", "att-name", a.name));
+  return chip;
+}
+
+function addUserMessage(text: string, atts: Attachment[] = []) {
   $("welcome")?.remove();
   const m = el("div", "msg user");
-  m.appendChild(el("div", "bubble", text));
+  const bubble = el("div", "bubble", text);
+  if (atts.length) {
+    const strip = el("div", "att-list");
+    atts.forEach((a) => strip.appendChild(attachmentChip(a)));
+    bubble.appendChild(strip);
+  }
+  m.appendChild(bubble);
   messagesEl.appendChild(m);
   scrollToBottom();
+}
+
+/* ---------------------------- attachments --------------------------- */
+
+let attachments: Attachment[] = [];
+
+function renderAttachStrip() {
+  const strip = $("attachStrip");
+  strip.innerHTML = "";
+  strip.classList.toggle("hidden", !attachments.length);
+  attachments.forEach((a, i) => {
+    const chip = attachmentChip(a);
+    const x = el("button", "att-remove", "✕");
+    x.title = "移除";
+    x.onclick = () => {
+      attachments.splice(i, 1);
+      renderAttachStrip();
+    };
+    chip.appendChild(x);
+    strip.appendChild(chip);
+  });
+}
+
+async function addFiles(files: File[] | FileList) {
+  for (const f of Array.from(files)) {
+    try {
+      statusText.textContent = `读取 ${f.name || "图片"}…`;
+      const a = await fileToAttachment(f);
+      const total = attachments.reduce((s, x) => s + x.bytes, 0) + a.bytes;
+      if (total > MAX_TOTAL_BYTES) {
+        statusText.textContent = "附件总大小超过 18MB，请分批发送";
+        break;
+      }
+      attachments.push(a);
+    } catch (e) {
+      statusText.textContent = (e as Error).message;
+    }
+  }
+  if (!busy && statusText.textContent?.startsWith("读取")) statusText.textContent = "";
+  renderAttachStrip();
 }
 
 function newAssistantBlock() {
@@ -338,13 +412,31 @@ function repairHistory() {
   }
 }
 
-async function runTurn(userText: string) {
+/** Older attachments are replaced by placeholders once total inline payload would exceed the request limit. */
+function pruneInlineData(incomingBytes: number) {
+  let total = incomingBytes;
+  const inlineParts: Part[] = [];
+  for (const c of history)
+    for (const p of c.parts)
+      if (p.inlineData) {
+        total += Math.round((p.inlineData.data.length * 3) / 4);
+        inlineParts.push(p);
+      }
+  for (const p of inlineParts) {
+    if (total <= MAX_TOTAL_BYTES) break;
+    total -= Math.round((p.inlineData!.data.length * 3) / 4);
+    delete p.inlineData;
+    p.text = "[较早的附件已从上下文中移除以节省空间]";
+  }
+}
+
+async function runTurn(userText: string, atts: Attachment[] = []) {
   if (!settings.apiKey) {
     openSettings();
     $("testStatus").textContent = "请先填写 Gemini API Key。";
     return;
   }
-  addUserMessage(userText);
+  addUserMessage(userText, atts);
   const block = newAssistantBlock();
   const undoOps: UndoOp[] = [];
   const tctx: ToolContext = { undo: undoOps };
@@ -353,7 +445,15 @@ async function runTurn(userText: string) {
   setBusy(true);
   abort = new AbortController();
 
-  pushUser([{ text: (await buildContextPrefix()) + userText }]);
+  const fileNote = atts.length ? `\n\n[附件 ${atts.length} 个，按顺序为：${atts.map((a) => a.name).join("，")}]` : "";
+  pruneInlineData(atts.reduce((s, a) => s + a.bytes, 0));
+  pushUser([
+    { text: (await buildContextPrefix()) + userText + fileNote },
+    ...atts.flatMap((a, i) => [
+      { text: `附件${i + 1}：${a.name}` },
+      { inlineData: { mimeType: a.mimeType, data: a.data } },
+    ]),
+  ]);
 
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
@@ -509,11 +609,15 @@ function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMet
 /* ------------------------------ wiring ------------------------------ */
 
 function send() {
-  const text = inputEl.value.trim();
-  if (!text || busy) return;
+  let text = inputEl.value.trim();
+  if (busy || (!text && !attachments.length)) return;
+  if (!text) text = INVOICE_PROMPT;
+  const atts = attachments;
+  attachments = [];
+  renderAttachStrip();
   inputEl.value = "";
   autosize();
-  runTurn(text);
+  runTurn(text, atts);
 }
 
 function autosize() {
@@ -528,8 +632,49 @@ function newChat() {
   location.reload();
 }
 
+let sendAfterPick = false;
+
+function bindAttachments() {
+  const fileInput = $<HTMLInputElement>("fileInput");
+  $("attachBtn").onclick = () => fileInput.click();
+  fileInput.onchange = async () => {
+    if (fileInput.files?.length) await addFiles(fileInput.files);
+    fileInput.value = "";
+    if (sendAfterPick && attachments.length) {
+      inputEl.value = INVOICE_PROMPT;
+      send();
+    }
+    sendAfterPick = false;
+  };
+  $("invoiceChip").onclick = () => {
+    sendAfterPick = true;
+    fileInput.click();
+  };
+  inputEl.addEventListener("paste", (e) => {
+    const files = Array.from(e.clipboardData?.files ?? []);
+    if (files.length) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  });
+  const composer = document.querySelector<HTMLElement>(".composer")!;
+  document.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    composer.classList.add("dragging");
+  });
+  document.addEventListener("dragleave", (e) => {
+    if (!e.relatedTarget) composer.classList.remove("dragging");
+  });
+  document.addEventListener("drop", (e) => {
+    e.preventDefault();
+    composer.classList.remove("dragging");
+    if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files);
+  });
+}
+
 function init() {
   bindSettings();
+  bindAttachments();
   refreshModelSelectors();
   sendBtn.onclick = send;
   stopBtn.onclick = () => {
@@ -544,7 +689,7 @@ function init() {
       send();
     }
   });
-  document.querySelectorAll<HTMLButtonElement>(".chip").forEach((c) => {
+  document.querySelectorAll<HTMLButtonElement>(".chip:not(.invoice)").forEach((c) => {
     c.onclick = () => {
       inputEl.value = c.textContent ?? "";
       send();

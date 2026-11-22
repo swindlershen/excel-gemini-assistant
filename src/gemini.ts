@@ -12,6 +12,7 @@ export interface FunctionCall {
 
 export interface Part {
   text?: string;
+  inlineData?: { mimeType: string; data: string };
   thought?: boolean;
   thoughtSignature?: string;
   functionCall?: FunctionCall;
