@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gemini 助手</title>
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <script type="module" crossorigin src="./assets/index-Cok5vIJH.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BfheF21P.css">
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <img src="./assets/icon-32.png" alt="" width="20" height="20" />
+          <span>Gemini 助手</span>
+        </div>
+        <div class="top-actions">
+          <select id="modelQuick" title="模型"></select>
+          <button id="newChatBtn" class="icon-btn" title="新对话">＋</button>
+          <button id="settingsBtn" class="icon-btn" title="设置">⚙</button>
+        </div>
+      </header>
+
+      <main id="messages">
+        <section id="welcome" class="welcome">
+          <h2>有什么可以帮你？</h2>
+          <p>我可以读取整个工作簿、用真实公式建模、整理格式、生成图表。所有修改都可以一键撤销。</p>
+          <div class="suggestions">
+            <button id="invoiceChip" class="chip invoice">🧾 扫描发票录入台账（选择图片 / PDF）</button>
+            <button class="chip">总结这个工作簿的结构和关键数据</button>
+            <button class="chip">解释选中单元格里的公式</button>
+            <button class="chip">检查工作簿里的错误值并修复</button>
+            <button class="chip">根据选中的数据生成合适的图表</button>
+            <button class="chip">把选中区域整理成带表头样式的表格</button>
+          </div>
+        </section>
+      </main>
+
+      <footer class="composer">
+        <div class="context-bar">
+          <span id="selectionPill" class="pill" title="当前选区会自动作为上下文发送">选区：-</span>
+          <span id="statusText" class="status"></span>
+        </div>
+        <div id="attachStrip" class="attach-strip hidden"></div>
+        <div class="input-row">
+          <button id="attachBtn" class="attach-btn" title="添加发票 / 图片 / PDF（也可直接粘贴截图或拖入文件）">📎</button>
+          <input id="fileInput" type="file" accept="image/*,application/pdf" multiple class="hidden" />
+          <textarea id="input" rows="1" placeholder="向 Gemini 提问或下达指令…（Enter 发送，可粘贴截图 / 拖入发票）"></textarea>
+          <button id="sendBtn" class="send-btn" title="发送">➤</button>
+          <button id="stopBtn" class="send-btn stop hidden" title="停止">■</button>
+        </div>
+      </footer>
+
+      <div id="settingsPanel" class="overlay hidden">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>设置</h3>
+            <button id="closeSettings" class="icon-btn">✕</button>
+          </div>
+          <label>Gemini API Key</label>
+          <div class="row">
+            <input id="apiKeyInput" type="password" placeholder="AIza…" autocomplete="off" />
+            <button id="toggleKey" class="small-btn">显示</button>
+          </div>
+          <p class="hint">
+            在 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a>
+            获取。Key 只保存在本机加载项存储中，仅直接发送给 Google。
+          </p>
+
+          <label>模型</label>
+          <select id="modelSelect"></select>
+          <div class="row">
+            <input id="customModelInput" placeholder="自定义模型 ID，如 gemini-4-neon" />
+            <button id="addModelBtn" class="small-btn">添加</button>
+          </div>
+          <div class="row">
+            <button id="fetchModelsBtn" class="small-btn">从 API 获取可用模型</button>
+            <span id="fetchStatus" class="hint"></span>
+          </div>
+
+          <label>思考深度（thinking level）</label>
+          <select id="thinkingSelect"></select>
+          <p class="hint">Gemini 4 支持 低 / 中 / 高（默认） / 极高。旧模型请选“默认”。</p>
+
+          <label class="check"><input id="confirmWrites" type="checkbox" /> 修改工作簿前需要我确认</label>
+
+          <div class="row end">
+            <button id="testBtn" class="small-btn">测试连接</button>
+            <button id="saveSettings" class="primary-btn">保存</button>
+          </div>
+          <p id="testStatus" class="hint"></p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
