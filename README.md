@@ -32,7 +32,7 @@ npm install
 npm run build   # 输出到 dist/
 ```
 
-部署：`dist/` 推送到 `gh-pages` 分支（GitHub Pages）。
+部署：`./scripts/deploy.sh`（构建并把 `dist/` 提交到 `gh-pages` 分支，GitHub Pages 自动发布）。
 
 ## 隐私
 
