@@ -32,7 +32,7 @@ const SYSTEM_PROMPT = `你是嵌入在 Microsoft Excel 侧边栏中的 AI 助手
 
 发票 / 票据识别（用户上传图片或 PDF 时）：
 - 逐张仔细识别，看不清或缺失的字段留空并在“备注”列注明“需核对”，绝不臆造号码或金额。
-- 默认录入到名为“发票台账”的工作表：不存在就用 add_sheet 新建并写表头；已存在则先 read_range 读取表头和已有数据，按现有表头列顺序在最后一行之后追加，不要覆盖已有行。
+- 默认录入到名为“收票登记”的工作表：不存在就用 add_sheet 新建并写表头；已存在则先 read_range 读取表头和已有数据，按现有表头列顺序在最后一行之后追加，不要覆盖已有行。
 - 默认表头：序号, 发票类型, 发票代码, 发票号码, 开票日期, 购买方名称, 购买方税号, 销售方名称, 销售方税号, 项目名称, 金额(不含税), 税率, 税额, 价税合计, 校验, 来源文件, 备注
   （全电发票没有发票代码则留空；项目名称多行时用“；”连接主要项目。）
 - 日期写成 yyyy-mm-dd；金额、税额写纯数字（不要带 ¥ 和逗号）；税率写成小数（如 0.13）并设置百分比格式；发票号码、税号、代码作为文本写入（在前面加英文单引号 ' 以保留前导零）。
@@ -42,7 +42,7 @@ const SYSTEM_PROMPT = `你是嵌入在 Microsoft Excel 侧边栏中的 AI 助手
 - 完成后用表格简要列出本次录入的发票（号码、销售方、价税合计）和需要人工核对的项。
 - 用户要求明细时，另建“发票明细”工作表，每个商品/服务一行，并带上发票号码关联。`;
 
-const INVOICE_PROMPT = "请识别附件中的发票，按规则录入“发票台账”工作表。";
+const INVOICE_PROMPT = "请识别附件中的发票，按规则录入“收票登记”工作表。";
 
 /* ------------------------------ state ------------------------------ */
 
@@ -574,20 +574,39 @@ function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMet
   const foot = el("div", "turn-footer");
   if (undoOps.length) {
     const btn = el("button", "small-btn", `↶ 撤销本轮修改（${undoOps.length} 项）`);
+    let remaining = [...undoOps].reverse();
+    let errBox: HTMLElement | null = null;
     btn.onclick = async () => {
+      if (busy) {
+        statusText.textContent = "请等当前任务结束后再撤销";
+        return;
+      }
       btn.disabled = true;
       btn.textContent = "撤销中…";
+      const failed: UndoOp[] = [];
       const errors: string[] = [];
-      for (const op of [...undoOps].reverse()) {
+      for (const op of remaining) {
         try {
           await op();
         } catch (e) {
-          errors.push((e as Error).message);
+          failed.push(op);
+          errors.push((e as Error).message || String(e));
         }
       }
-      btn.textContent = errors.length ? `已撤销（${errors.length} 项失败）` : "✓ 已撤销";
-      if (errors.length) btn.title = errors.join("\n");
-      pushUser([{ text: "[系统提示] 用户已撤销了你上一轮对工作簿所做的全部修改。" }]);
+      errBox?.remove();
+      errBox = null;
+      if (failed.length) {
+        remaining = failed;
+        btn.disabled = false;
+        btn.textContent = `↶ 重试撤销（${failed.length} 项失败）`;
+        errBox = el("div", "error-box", `撤销失败：\n${errors.join("\n")}`);
+        errBox.style.whiteSpace = "pre-wrap";
+        foot.after(errBox);
+      } else {
+        btn.textContent = "✓ 已撤销";
+        pushUser([{ text: "[系统提示] 用户已撤销了你上一轮对工作簿所做的全部修改。" }]);
+      }
+      refreshSelectionPill();
     };
     foot.appendChild(btn);
   }

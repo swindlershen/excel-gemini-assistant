@@ -5,6 +5,7 @@ export type UndoOp = () => Promise<void>;
 
 export interface ToolContext {
   undo: UndoOp[];
+  createdSheets?: Set<string>;
 }
 
 export interface ChangedRange {
@@ -74,6 +75,44 @@ const PROPS_LOAD: Excel.CellPropertiesLoadOptions = {
   },
 };
 
+function stripNulls(o: unknown): unknown {
+  if (Array.isArray(o)) return o.map(stripNulls);
+  if (o && typeof o === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(o)) {
+      if (v === null || v === undefined) continue;
+      const s = stripNulls(v);
+      if (s && typeof s === "object" && !Array.isArray(s) && !Object.keys(s).length) continue;
+      out[k] = s;
+    }
+    return out;
+  }
+  return o;
+}
+
+function sanitizeProps(cell: Excel.CellProperties): Excel.SettableCellProperties {
+  const c = JSON.parse(JSON.stringify(cell)) as { format?: Record<string, any> };
+  const f = c.format;
+  if (f) {
+    const fill = f.fill as { pattern?: string; color?: string } | undefined;
+    if (fill) {
+      // fill.pattern needs a newer API set; keep only a real solid color.
+      if (fill.pattern === "None" || !fill.color || /^#?FFFFFF$/i.test(fill.color)) delete f.fill;
+      else f.fill = { color: fill.color };
+    }
+    if (f.borders) {
+      for (const k of Object.keys(f.borders)) {
+        const b = f.borders[k];
+        if (!b || b.style === "None") delete f.borders[k];
+        else f.borders[k] = { style: b.style, color: b.color, weight: b.weight };
+      }
+    }
+  }
+  return stripNulls(c) as Excel.SettableCellProperties;
+}
+
+const ALL_EDGES = ["EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight", "InsideHorizontal", "InsideVertical"] as const;
+
 /** Captures formulas, number formats and (for small ranges) cell formatting; returns an undo op. */
 async function snapshotRange(sheetName: string | undefined, address: string): Promise<UndoOp | null> {
   return Excel.run(async (ctx) => {
@@ -86,36 +125,55 @@ async function snapshotRange(sheetName: string | undefined, address: string): Pr
     r.load(["formulas", "numberFormat"]);
     let propsResult: OfficeExtension.ClientResult<Excel.CellProperties[][]> | null = null;
     if (r.cellCount <= MAX_PROPS_SNAPSHOT_CELLS) propsResult = r.getCellProperties(PROPS_LOAD);
-    await ctx.sync();
+    try {
+      await ctx.sync();
+    } catch {
+      // getCellProperties unsupported on this Excel build: retry without formatting.
+      propsResult = null;
+      r.load(["formulas", "numberFormat"]);
+      await ctx.sync();
+    }
 
     const sheet = ws.name;
     const formulas = r.formulas;
     const numberFormat = r.numberFormat;
-    const props = propsResult
-      ? propsResult.value.map((row) =>
-          row.map((cell) => {
-            const c = JSON.parse(JSON.stringify(cell)) as Excel.SettableCellProperties;
-            const fill = c.format?.fill as { pattern?: string; color?: string } | undefined;
-            if (fill && (fill.pattern === "None" || !fill.pattern)) delete c.format!.fill;
-            return c;
-          })
-        )
-      : null;
+    const props = propsResult ? propsResult.value.map((row) => row.map(sanitizeProps)) : null;
 
     return async () => {
-      await Excel.run(async (ctx2) => {
-        const r2 = ctx2.workbook.worksheets.getItem(sheet).getRange(address);
-        if (props) r2.format.fill.clear();
-        r2.formulas = formulas;
-        r2.numberFormat = numberFormat;
-        if (props) r2.setCellProperties(props);
-        await ctx2.sync();
-      });
+      const errors: string[] = [];
+      const step = async (label: string, fn: (rg: Excel.Range) => void) => {
+        try {
+          await Excel.run(async (ctx2) => {
+            fn(ctx2.workbook.worksheets.getItem(sheet).getRange(address));
+            await ctx2.sync();
+          });
+        } catch (e) {
+          errors.push(`${label}: ${(e as Error).message}`);
+        }
+      };
+      await step("取消合并", (rg) => rg.unmerge());
+      await step("还原内容", (rg) => (rg.formulas = formulas));
+      await step("还原数字格式", (rg) => (rg.numberFormat = numberFormat));
+      if (props) {
+        await step("还原格式", (rg) => {
+          rg.format.fill.clear();
+          ALL_EDGES.forEach((e) => (rg.format.borders.getItem(e).style = "None"));
+          rg.format.font.bold = false;
+          rg.format.font.italic = false;
+          rg.setCellProperties(props);
+        });
+      }
+      // Content restore is what matters; only fail if that failed.
+      const fatal = errors.filter((e) => e.startsWith("还原内容"));
+      if (fatal.length) throw new Error(`${sheet}!${address} ${fatal.join("; ")}`);
+      if (errors.length) console.warn("Undo formatting partially failed", errors);
     };
   });
 }
 
 async function pushSnapshot(tctx: ToolContext, sheet: string | undefined, address: string) {
+  // Sheets created in this turn are simply deleted on undo; no need to snapshot them.
+  if (sheet && tctx.createdSheets?.has(sheet)) return;
   const op = await snapshotRange(sheet, address);
   if (op) tctx.undo.push(op);
 }
@@ -622,9 +680,17 @@ async function addSheet(a: Args, tctx: ToolContext): Promise<ToolResult> {
     if (a.activate !== false) ws.activate();
     await ctx.sync();
   });
+  tctx.createdSheets ??= new Set();
+  tctx.createdSheets.add(name);
   tctx.undo.push(async () =>
     Excel.run(async (ctx) => {
-      ctx.workbook.worksheets.getItem(name).delete();
+      const ws = ctx.workbook.worksheets.getItem(name);
+      const sheets = ctx.workbook.worksheets;
+      sheets.load("items/name,items/visibility");
+      await ctx.sync();
+      const other = sheets.items.find((s) => s.name !== name && s.visibility === "Visible");
+      if (other) other.activate();
+      ws.delete();
       await ctx.sync();
     })
   );
