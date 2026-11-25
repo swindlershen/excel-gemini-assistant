@@ -15,7 +15,7 @@ import {
 } from "./tools";
 import { PRESET_MODELS, THINKING_LEVELS, Settings, loadSettings, saveSettings } from "./settings";
 import { Attachment, MAX_TOTAL_BYTES, fileToAttachment } from "./attachments";
-import { extractInvoices, summarize, writeInvoices } from "./invoice";
+import { extractInvoices, inspectInvoiceSheet, readPendingOrders, summarize, writeInvoices } from "./invoice";
 
 const MAX_STEPS = 40;
 
@@ -601,13 +601,24 @@ async function runInvoiceTurn(userText: string, atts: Attachment[]) {
   abort = new AbortController();
   try {
     if (!inExcel()) throw new Error("当前不在 Excel 环境中。");
-    statusText.textContent = `识别 ${atts.length} 个文件…`;
+    statusText.textContent = "读取待收票订单…";
+    const layout = await inspectInvoiceSheet();
+    const pendingOrders = layout.mode === "project" ? await readPendingOrders() : [];
+    statusText.textContent = `识别 ${atts.length} 个文件${pendingOrders.length ? `（匹配 ${pendingOrders.length} 条待收票订单）` : ""}…`;
     const extra = userText === INVOICE_PROMPT ? "" : userText;
-    const r = await extractInvoices(settings.apiKey, settings.model, settings.thinkingLevel, atts, extra, abort.signal);
+    const r = await extractInvoices(
+      settings.apiKey,
+      settings.model,
+      settings.thinkingLevel,
+      atts,
+      extra,
+      pendingOrders,
+      abort.signal
+    );
     usage = r.usage ?? {};
     if (!r.invoices.length) throw new Error("没有在附件中识别到发票。");
     statusText.textContent = "写入工作表…";
-    const res = await writeInvoices(r.invoices, atts, tctx);
+    const res = await writeInvoices(layout, r.invoices, atts, tctx);
     const md = el("div", "md");
     const summary = summarize(res);
     renderMarkdown(md, summary);
