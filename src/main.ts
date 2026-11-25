@@ -15,7 +15,15 @@ import {
 } from "./tools";
 import { PRESET_MODELS, THINKING_LEVELS, Settings, loadSettings, saveSettings } from "./settings";
 import { Attachment, MAX_TOTAL_BYTES, fileToAttachment } from "./attachments";
-import { extractInvoices, inspectInvoiceSheet, readPendingOrders, summarize, writeInvoices } from "./invoice";
+import {
+  OrderDiscrepancy,
+  extractInvoices,
+  inspectInvoiceSheet,
+  readPendingOrders,
+  summarize,
+  updateOrderAmount,
+  writeInvoices,
+} from "./invoice";
 
 const MAX_STEPS = 40;
 
@@ -623,6 +631,7 @@ async function runInvoiceTurn(userText: string, atts: Attachment[]) {
     const summary = summarize(res);
     renderMarkdown(md, summary);
     block.appendChild(md);
+    if (res.discrepancies?.length) renderDiscrepancies(block, res.discrepancies);
     // Give the chat model a compact text record (no images) for follow-up questions.
     pushUser([{ text: `[系统记录] 用户通过“扫描发票”录入了发票，结果如下：\n${summary}\n识别数据：${JSON.stringify(r.invoices)}` }]);
     history.push({ role: "model", parts: [{ text: "已记录。" }] });
@@ -636,6 +645,82 @@ async function runInvoiceTurn(userText: string, atts: Attachment[]) {
     renderTurnFooter(block, undoOps, usage, 1);
     refreshSelectionPill();
   }
+}
+
+function renderDiscrepancies(block: HTMLElement, list: OrderDiscrepancy[]) {
+  const fmt = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  for (const d of list) {
+    const card = el("div", "diff-card");
+    const head = el("div", "diff-head");
+    head.appendChild(el("span", "diff-title", `⚠️ 金额差异：订单 ${d.orderNo || "（未填单号）"}`));
+    const jumpAddr =
+      d.orderSheetRows.length === 1
+        ? `${d.costCol}${d.orderSheetRows[0]}`
+        : `${d.costCol}${d.orderSheetRows[0]}:${d.costCol}${d.orderSheetRows[d.orderSheetRows.length - 1]}`;
+    const link = el("a", "range-link", `${d.orderSheet}!${jumpAddr}`);
+    link.href = "#";
+    link.onclick = (e) => {
+      e.preventDefault();
+      selectAddress(d.orderSheet, jumpAddr).catch(() => {});
+    };
+    head.appendChild(link);
+    card.appendChild(head);
+
+    const sign = d.diff > 0 ? "+" : "";
+    card.appendChild(
+      el(
+        "div",
+        "diff-info",
+        `${d.itemSummary ? `${d.itemSummary} · ` : ""}采购订单 ${fmt(d.orderAmount)} vs 已收票 ${fmt(d.invoicedAmount)}（差额 ${sign}${fmt(d.diff)}）`
+      )
+    );
+
+    const actions = el("div", "diff-actions");
+    if (d.orderSheetRows.length === 1) {
+      const btn = el(
+        "button",
+        "primary-btn small",
+        `按发票金额修改采购订单（${fmt(d.orderAmount)} → ${fmt(d.invoicedAmount)}）`
+      );
+      btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = "修改中…";
+        try {
+          const { status, undo } = await updateOrderAmount(d);
+          actions.innerHTML = "";
+          actions.appendChild(
+            el("span", "diff-ok", `✓ 已更新为 ${fmt(d.invoicedAmount)}${status ? `（${status}）` : ""}`)
+          );
+          const undoBtn = el("button", "small-btn", "↶ 撤销此修改");
+          undoBtn.onclick = async () => {
+            undoBtn.disabled = true;
+            try {
+              await undo();
+              actions.innerHTML = "";
+              btn.disabled = false;
+              btn.textContent = `按发票金额修改采购订单（${fmt(d.orderAmount)} → ${fmt(d.invoicedAmount)}）`;
+              actions.appendChild(btn);
+            } catch (err) {
+              undoBtn.disabled = false;
+              undoBtn.textContent = `撤销失败：${(err as Error).message}`;
+            }
+          };
+          actions.appendChild(undoBtn);
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = `修改失败，点此重试（${(err as Error).message}）`;
+        }
+      };
+      actions.appendChild(btn);
+    } else {
+      actions.appendChild(
+        el("span", "hint", `该订单包含 ${d.orderSheetRows.length} 个产品行（可能是分批开票），请点右上角地址手动核对。`)
+      );
+    }
+    card.appendChild(actions);
+    block.appendChild(card);
+  }
+  scrollToBottom();
 }
 
 // USD per 1M tokens [input, output incl. thinking]

@@ -145,3 +145,11 @@ html, body { margin: 0; height: 100%; background: var(--bg); }
 .att-list .att { background: rgba(255,255,255,0.7); }
 .composer.dragging .input-row { border-color: var(--accent); border-style: dashed; background: #f1f6fe; }
 .chip.invoice { border-color: #c6dafc; background: #f1f6fe; font-weight: 600; }
+
+/* invoice vs purchase-order discrepancy cards */
+.diff-card { border: 1px solid #f5c26b; background: #fff8e6; border-radius: 8px; padding: 8px 10px; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.diff-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+.diff-title { font-weight: 600; color: #9a5b00; }
+.diff-info { color: var(--text); line-height: 1.45; }
+.diff-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.diff-ok { color: var(--ok); font-weight: 600; }

@@ -71,6 +71,7 @@ interface TemplateLayout {
     note: number;
     platform: number;
     ticketType: number;
+    orderKey: number;
     check: number;
   };
 }
@@ -205,6 +206,7 @@ export async function inspectInvoiceSheet(): Promise<SheetLayout> {
         note: findCol("备注"),
         platform: findCol("匹配平台"),
         ticketType: findCol("匹配票种"),
+        orderKey: findCol("订单核对键"),
         check: findCol("发票分配校验"),
       };
       const headerRow = used.rowIndex + projectHeaderOffset;
@@ -422,11 +424,26 @@ export interface WrittenRowSummary {
   note: string;
 }
 
+export interface OrderDiscrepancy {
+  orderNo: string;
+  orderKey: string;
+  orderSheet: string;
+  orderSheetRows: number[]; // 1-based Excel rows in 采购订单
+  costCol: string; // e.g. "I"
+  statusCol: string; // e.g. "N"
+  itemSummary: string;
+  orderAmount: number; // 同订单同类成本 (K)
+  invoicedAmount: number; // 已收票分配金额 (L)
+  diff: number; // 成本减已收票 (M = K - L)
+  status: string; // 核对状态 (N)
+}
+
 export interface WriteResult {
   sheet: string;
   address: string | null;
   rows: WrittenRowSummary[];
   duplicates: InvoiceRecord[];
+  discrepancies?: OrderDiscrepancy[];
   created: boolean;
 }
 
@@ -525,7 +542,7 @@ async function writeProjectInvoices(
     }
   }
 
-  const checkStatuses = await Excel.run(async (ctx) => {
+  const { checkStatuses, orderKeys } = await Excel.run(async (ctx) => {
     const ws = ctx.workbook.worksheets.getItem(INVOICE_SHEET);
     for (const ch of chunks) {
       for (const cw of buildColWrites(ch.indices)) {
@@ -545,17 +562,35 @@ async function writeProjectInvoices(
     sel.select();
     await ctx.sync();
 
-    if (cols.check >= 0) {
-      const ckRanges = chunks.map((ch) => {
-        const ck = ws.getRangeByIndexes(ch.startRow, cols.check, ch.indices.length, 1);
-        ck.load("values");
-        return ck;
-      });
-      await ctx.sync();
-      return ckRanges.flatMap((ck) => ck.values.map((r) => String(r[0] ?? "")));
-    }
-    return toWrite.map(() => "");
+    const ckRanges =
+      cols.check >= 0
+        ? chunks.map((ch) => {
+            const ck = ws.getRangeByIndexes(ch.startRow, cols.check, ch.indices.length, 1);
+            ck.load("values");
+            return ck;
+          })
+        : [];
+    const keyRanges =
+      cols.orderKey >= 0
+        ? chunks.map((ch) => {
+            const kr = ws.getRangeByIndexes(ch.startRow, cols.orderKey, ch.indices.length, 1);
+            kr.load("values");
+            return kr;
+          })
+        : [];
+    if (ckRanges.length || keyRanges.length) await ctx.sync();
+    return {
+      checkStatuses: ckRanges.length
+        ? ckRanges.flatMap((ck) => ck.values.map((r) => String(r[0] ?? "")))
+        : toWrite.map(() => ""),
+      orderKeys: keyRanges.length
+        ? keyRanges.flatMap((kr) => kr.values.map((r) => String(r[0] ?? "").trim()))
+        : toWrite.map(() => ""),
+    };
   });
+
+  const uniqueKeys = Array.from(new Set(orderKeys.filter(Boolean)));
+  const discrepancies = uniqueKeys.length ? await findOrderDiscrepancies(uniqueKeys) : [];
 
   const rows: WrittenRowSummary[] = toWrite.map((r, i) => ({
     rowNum: targetRows[i] + 1,
@@ -570,7 +605,151 @@ async function writeProjectInvoices(
     chunks.length === 1
       ? `第 ${targetRows[0] + 1}${targetRows.length > 1 ? `～${targetRows[targetRows.length - 1] + 1}` : ""} 行`
       : `第 ${targetRows.map((r) => r + 1).join("、")} 行`;
-  return { sheet: INVOICE_SHEET, address, rows, duplicates, created: false };
+  return { sheet: INVOICE_SHEET, address, rows, duplicates, discrepancies, created: false };
+}
+
+/** Inspects 「采购订单」 for the matched 订单核对键 values and returns any with amount discrepancies. */
+async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrepancy[]> {
+  const keySet = new Set(orderKeys);
+  return Excel.run(async (ctx) => {
+    const ws = ctx.workbook.worksheets.getItemOrNullObject(ORDER_SHEET);
+    await ctx.sync();
+    if (ws.isNullObject) return [];
+    const used = ws.getUsedRangeOrNullObject(true);
+    used.load("rowCount,columnCount,rowIndex,columnIndex");
+    await ctx.sync();
+    if (used.isNullObject) return [];
+
+    const cols = Math.min(16, used.columnCount);
+    const r = used.getCell(0, 0).getResizedRange(used.rowCount - 1, cols - 1);
+    r.load("values");
+    await ctx.sync();
+
+    let hRow = -1;
+    let headers: string[] = [];
+    for (let i = 0; i < Math.min(10, r.values.length); i++) {
+      const row = r.values[i].map((v) => String(v ?? "").trim());
+      if (row.some((h) => h.includes("订单核对键")) && row.some((h) => h.includes("含税成本"))) {
+        hRow = i;
+        headers = row;
+        break;
+      }
+    }
+    if (hRow < 0) return [];
+    const idx = (kw: string) => headers.findIndex((h) => h.includes(kw));
+    const cSeq = idx("序号");
+    const cItem = idx("品名");
+    const cOrder = idx("平台订单号");
+    const cCost = idx("含税成本");
+    const cKey = idx("订单核对键");
+    const cOrdTotal = idx("同订单同类成本");
+    const cInvTotal = idx("已收票分配金额");
+    const cDiff = idx("成本减已收票");
+    const cStatus = idx("核对状态");
+    if (cKey < 0 || cCost < 0) return [];
+
+    const groups = new Map<
+      string,
+      {
+        orderNo: string;
+        rows: number[];
+        items: string[];
+        orderAmount: number;
+        invoicedAmount: number;
+        diff: number;
+        status: string;
+      }
+    >();
+
+    for (let i = hRow + 1; i < r.values.length; i++) {
+      const row = r.values[i];
+      const key = String(row[cKey] ?? "").trim();
+      if (!key || !keySet.has(key)) continue;
+      const excelRow = used.rowIndex + i + 1;
+      const seq = cSeq >= 0 ? String(row[cSeq] ?? "").trim() : "";
+      const item = cItem >= 0 ? String(row[cItem] ?? "").trim() : "";
+      const label = [seq ? `序号${seq}` : "", item].filter(Boolean).join(" ");
+      const orderNo = cOrder >= 0 ? String(row[cOrder] ?? "").trim() : "";
+      const orderAmount = Number(cOrdTotal >= 0 ? row[cOrdTotal] : row[cCost]);
+      const invoicedAmount = Number(cInvTotal >= 0 ? row[cInvTotal] : 0);
+      const diff = Number(cDiff >= 0 ? row[cDiff] : orderAmount - invoicedAmount);
+      const status = cStatus >= 0 ? String(row[cStatus] ?? "").trim() : "";
+
+      const g = groups.get(key);
+      if (g) {
+        g.rows.push(excelRow);
+        if (label) g.items.push(label);
+      } else {
+        groups.set(key, {
+          orderNo,
+          rows: [excelRow],
+          items: label ? [label] : [],
+          orderAmount: isFinite(orderAmount) ? orderAmount : 0,
+          invoicedAmount: isFinite(invoicedAmount) ? invoicedAmount : 0,
+          diff: isFinite(diff) ? diff : 0,
+          status,
+        });
+      }
+    }
+
+    const out: OrderDiscrepancy[] = [];
+    const costCol = colLetter(used.columnIndex + cCost);
+    const statusCol = cStatus >= 0 ? colLetter(used.columnIndex + cStatus) : "";
+    for (const [orderKey, g] of groups) {
+      if (g.status === "金额差异" || Math.abs(g.diff) >= 0.005) {
+        out.push({
+          orderNo: g.orderNo,
+          orderKey,
+          orderSheet: ORDER_SHEET,
+          orderSheetRows: g.rows,
+          costCol,
+          statusCol,
+          itemSummary: g.items.slice(0, 2).join("；") + (g.items.length > 2 ? ` 等${g.items.length}项` : ""),
+          orderAmount: g.orderAmount,
+          invoicedAmount: g.invoicedAmount,
+          diff: g.diff,
+          status: g.status || "金额差异",
+        });
+      }
+    }
+    return out;
+  });
+}
+
+/** One-click update of a single-row purchase order's 含税成本 to match the invoice amount, with undo. */
+export async function updateOrderAmount(
+  d: OrderDiscrepancy
+): Promise<{ status: string; undo: () => Promise<void> }> {
+  if (d.orderSheetRows.length !== 1) throw new Error("该订单包含多行产品，请手动核对修改。");
+  const row = d.orderSheetRows[0];
+  const addr = `${d.costCol}${row}`;
+  const { oldVal, newStatus } = await Excel.run(async (ctx) => {
+    const ws = ctx.workbook.worksheets.getItem(d.orderSheet);
+    const rg = ws.getRange(addr);
+    rg.load("formulas");
+    await ctx.sync();
+    const prev = rg.formulas;
+    rg.formulas = [[d.invoicedAmount]];
+    ws.activate();
+    rg.select();
+    await ctx.sync();
+    let st = "";
+    if (d.statusCol) {
+      const sr = ws.getRange(`${d.statusCol}${row}`);
+      sr.load("values");
+      await ctx.sync();
+      st = String(sr.values[0][0] ?? "");
+    }
+    return { oldVal: prev, newStatus: st };
+  });
+  const undo = async () => {
+    await Excel.run(async (ctx) => {
+      const ws = ctx.workbook.worksheets.getItem(d.orderSheet);
+      ws.getRange(addr).formulas = oldVal;
+      await ctx.sync();
+    });
+  };
+  return { status: newStatus, undo };
 }
 
 async function writeGenericInvoices(
