@@ -817,6 +817,7 @@ function renderDiscrepancies(block: HTMLElement, list: OrderDiscrepancy[]) {
 
 // USD per 1M tokens [input, output incl. thinking]
 const PRICES: Record<string, [number, number]> = {
+  "gemini-3.8-flash": [0.75, 3.75],
   "gemini-4-hydrogen": [1.5, 7.5],
   "gemini-4-neon": [3, 15],
 };
