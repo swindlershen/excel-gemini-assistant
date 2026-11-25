@@ -232,12 +232,12 @@ export const TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: "clear_range",
-    description: "清除区域的内容、格式或全部。",
+    description: "清除一个或多个区域的内容、格式或全部。多个不连续区域可用英文逗号分隔一次清除（如 'A56:B56,D56,G56:H56,M56:O56'）。",
     parameters: {
       type: "OBJECT",
       properties: {
         sheet: SHEET,
-        address: S("A1 格式地址。"),
+        address: S("A1 格式地址，支持逗号分隔多个区域，如 'A56:B56,D56,G56:H56'。"),
         what: { type: "STRING", enum: ["contents", "formats", "all"], description: "清除内容，默认 contents。" },
       },
       required: ["address"],
@@ -636,15 +636,27 @@ async function formatRange(a: Args, tctx: ToolContext): Promise<ToolResult> {
 }
 
 async function clearRange(a: Args, tctx: ToolContext): Promise<ToolResult> {
-  const t = await resolveTarget(a);
-  await pushSnapshot(tctx, t.sheet, t.address);
+  const rawAddr = String(a.address ?? "").trim();
+  if (!rawAddr) throw new Error("缺少 address");
+  const parts = rawAddr.split(",").map((s) => s.trim()).filter(Boolean);
+  const targets: ChangedRange[] = [];
+  for (const part of parts) {
+    const t = await resolveTarget({ sheet: a.sheet, address: part });
+    await pushSnapshot(tctx, t.sheet, t.address);
+    targets.push(t);
+  }
   const what = str(a.what) ?? "contents";
   const applyTo = what === "all" ? "All" : what === "formats" ? "Formats" : "Contents";
   await Excel.run(async (ctx) => {
-    ctx.workbook.worksheets.getItem(t.sheet).getRange(t.address).clear(applyTo as Excel.ClearApplyTo);
+    for (const t of targets) {
+      ctx.workbook.worksheets.getItem(t.sheet).getRange(t.address).clear(applyTo as Excel.ClearApplyTo);
+    }
     await ctx.sync();
   });
-  return { response: { cleared: `${t.sheet}!${t.address}`, what }, changed: [t] };
+  return {
+    response: { cleared: targets.map((t) => `${t.sheet}!${t.address}`), what },
+    changed: targets,
+  };
 }
 
 async function insertCells(a: Args, tctx: ToolContext): Promise<ToolResult> {
