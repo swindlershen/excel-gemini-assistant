@@ -15,6 +15,7 @@ import {
 } from "./tools";
 import { PRESET_MODELS, THINKING_LEVELS, Settings, loadSettings, saveSettings } from "./settings";
 import { Attachment, MAX_TOTAL_BYTES, fileToAttachment } from "./attachments";
+import { extractInvoices, summarize, writeInvoices } from "./invoice";
 
 const MAX_STEPS = 40;
 
@@ -30,7 +31,7 @@ const SYSTEM_PROMPT = `你是嵌入在 Microsoft Excel 侧边栏中的 AI 助手
 7. 用用户使用的语言回答（默认中文），简洁、专业，适当使用 Markdown 表格。
 8. 如果无法完成（例如缺少数据或 API 不支持），直接说明原因，不要编造结果。
 
-发票 / 票据识别（用户上传图片或 PDF 时）：
+发票 / 票据识别（用户上传图片或 PDF 并要求录入时；尽量一次性写入所有行，减少工具调用次数）：
 - 逐张仔细识别，看不清或缺失的字段留空并在“备注”列注明“需核对”，绝不臆造号码或金额。
 - 默认录入到名为“收票登记”的工作表：不存在就用 add_sheet 新建并写表头；已存在则先 read_range 读取表头和已有数据，按现有表头列顺序在最后一行之后追加，不要覆盖已有行。
 - 默认表头：序号, 发票类型, 发票代码, 发票号码, 开票日期, 购买方名称, 购买方税号, 销售方名称, 销售方税号, 项目名称, 金额(不含税), 税率, 税额, 价税合计, 校验, 来源文件, 备注
@@ -441,6 +442,7 @@ async function runTurn(userText: string, atts: Attachment[] = []) {
   const undoOps: UndoOp[] = [];
   const tctx: ToolContext = { undo: undoOps };
   const usageTotal: UsageMetadata = { promptTokenCount: 0, candidatesTokenCount: 0, thoughtsTokenCount: 0 };
+  let apiCalls = 0;
 
   setBusy(true);
   abort = new AbortController();
@@ -465,6 +467,7 @@ async function runTurn(userText: string, atts: Attachment[] = []) {
       let usage: UsageMetadata | undefined;
 
       statusText.textContent = step === 0 ? "思考中…" : "继续处理…";
+      apiCalls++;
       for await (const chunk of streamGenerate({
         apiKey: settings.apiKey,
         model: settings.model,
@@ -563,14 +566,74 @@ async function runTurn(userText: string, atts: Attachment[] = []) {
     else addError(block, `出错了：${(e as Error).message ?? e}`);
   } finally {
     repairHistory();
+    dropInlineData();
     setBusy(false);
     abort = null;
-    renderTurnFooter(block, undoOps, usageTotal);
+    renderTurnFooter(block, undoOps, usageTotal, apiCalls);
     refreshSelectionPill();
   }
 }
 
-function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMetadata) {
+/** Attachments are only needed in the turn they were sent; keeping them would re-bill them on every later call. */
+function dropInlineData() {
+  for (const c of history)
+    for (const p of c.parts)
+      if (p.inlineData) {
+        delete p.inlineData;
+        p.text = "[附件内容已在上一轮处理，如需再次分析请重新上传]";
+      }
+}
+
+/* --------------------------- invoice fast path --------------------------- */
+
+async function runInvoiceTurn(userText: string, atts: Attachment[]) {
+  if (!settings.apiKey) {
+    openSettings();
+    $("testStatus").textContent = "请先填写 Gemini API Key。";
+    return;
+  }
+  addUserMessage(userText, atts);
+  const block = newAssistantBlock();
+  const undoOps: UndoOp[] = [];
+  const tctx: ToolContext = { undo: undoOps };
+  let usage: UsageMetadata = {};
+  setBusy(true);
+  abort = new AbortController();
+  try {
+    if (!inExcel()) throw new Error("当前不在 Excel 环境中。");
+    statusText.textContent = `识别 ${atts.length} 个文件…`;
+    const extra = userText === INVOICE_PROMPT ? "" : userText;
+    const r = await extractInvoices(settings.apiKey, settings.model, settings.thinkingLevel, atts, extra, abort.signal);
+    usage = r.usage ?? {};
+    if (!r.invoices.length) throw new Error("没有在附件中识别到发票。");
+    statusText.textContent = "写入工作表…";
+    const res = await writeInvoices(r.invoices, atts, tctx);
+    const md = el("div", "md");
+    const summary = summarize(res);
+    renderMarkdown(md, summary);
+    block.appendChild(md);
+    // Give the chat model a compact text record (no images) for follow-up questions.
+    pushUser([{ text: `[系统记录] 用户通过“扫描发票”录入了发票，结果如下：\n${summary}\n识别数据：${JSON.stringify(r.invoices)}` }]);
+    history.push({ role: "model", parts: [{ text: "已记录。" }] });
+  } catch (e) {
+    if ((e as Error).name === "AbortError") addError(block, "已停止。");
+    else if (e instanceof GeminiError) addError(block, `Gemini API 错误：${e.message}`);
+    else addError(block, `出错了：${(e as Error).message ?? e}`);
+  } finally {
+    setBusy(false);
+    abort = null;
+    renderTurnFooter(block, undoOps, usage, 1);
+    refreshSelectionPill();
+  }
+}
+
+// USD per 1M tokens [input, output incl. thinking]
+const PRICES: Record<string, [number, number]> = {
+  "gemini-4-hydrogen": [1.5, 7.5],
+  "gemini-4-neon": [3, 15],
+};
+
+function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMetadata, calls = 1) {
   const foot = el("div", "turn-footer");
   if (undoOps.length) {
     const btn = el("button", "small-btn", `↶ 撤销本轮修改（${undoOps.length} 项）`);
@@ -611,16 +674,23 @@ function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMet
     foot.appendChild(btn);
   }
   const total = (usage.promptTokenCount ?? 0) + (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0);
-  if (total)
+  if (total) {
+    const price = PRICES[settings.model];
+    const cost = price
+      ? ((usage.promptTokenCount ?? 0) * price[0] +
+          ((usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0)) * price[1]) /
+        1e6
+      : null;
     foot.appendChild(
       el(
         "span",
         "usage",
-        `${settings.model} · 输入 ${usage.promptTokenCount} · 输出 ${usage.candidatesTokenCount}${
+        `${settings.model} · ${calls} 次调用 · 输入 ${usage.promptTokenCount} · 输出 ${usage.candidatesTokenCount}${
           usage.thoughtsTokenCount ? ` · 思考 ${usage.thoughtsTokenCount}` : ""
-        } tokens`
+        } tokens${cost !== null ? ` · 约 $${cost.toFixed(3)}` : ""}`
       )
     );
+  }
   if (foot.childNodes.length) block.appendChild(foot);
   scrollToBottom();
 }
@@ -630,13 +700,15 @@ function renderTurnFooter(block: HTMLElement, undoOps: UndoOp[], usage: UsageMet
 function send() {
   let text = inputEl.value.trim();
   if (busy || (!text && !attachments.length)) return;
-  if (!text) text = INVOICE_PROMPT;
   const atts = attachments;
   attachments = [];
   renderAttachStrip();
   inputEl.value = "";
   autosize();
-  runTurn(text, atts);
+  // Attachments with no instruction (or the invoice button) use the cheap one-call invoice path.
+  if (atts.length && (!text || text === INVOICE_PROMPT || forceInvoice)) runInvoiceTurn(text || INVOICE_PROMPT, atts);
+  else runTurn(text, atts);
+  forceInvoice = false;
 }
 
 function autosize() {
@@ -652,6 +724,7 @@ function newChat() {
 }
 
 let sendAfterPick = false;
+let forceInvoice = false;
 
 function bindAttachments() {
   const fileInput = $<HTMLInputElement>("fileInput");
@@ -660,7 +733,7 @@ function bindAttachments() {
     if (fileInput.files?.length) await addFiles(fileInput.files);
     fileInput.value = "";
     if (sendAfterPick && attachments.length) {
-      inputEl.value = INVOICE_PROMPT;
+      forceInvoice = true;
       send();
     }
     sendAfterPick = false;

@@ -51,6 +51,7 @@ export interface GenerateOptions {
   systemInstruction?: string;
   tools?: FunctionDeclaration[];
   thinkingLevel?: string; // "", "low", "medium", "high", "xhigh"
+  responseSchema?: Record<string, unknown>;
   signal?: AbortSignal;
 }
 
@@ -98,9 +99,13 @@ export async function* streamGenerate(opts: GenerateOptions): AsyncGenerator<Str
   if (opts.tools?.length) {
     body.tools = [{ functionDeclarations: opts.tools }];
   }
-  if (opts.thinkingLevel) {
-    body.generationConfig = { thinkingConfig: { thinkingLevel: opts.thinkingLevel } };
+  const gen: Record<string, unknown> = {};
+  if (opts.thinkingLevel) gen.thinkingConfig = { thinkingLevel: opts.thinkingLevel };
+  if (opts.responseSchema) {
+    gen.responseMimeType = "application/json";
+    gen.responseSchema = opts.responseSchema;
   }
+  if (Object.keys(gen).length) body.generationConfig = gen;
 
   const res = await doFetch(url, {
     method: "POST",

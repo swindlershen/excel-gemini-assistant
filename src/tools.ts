@@ -171,7 +171,7 @@ async function snapshotRange(sheetName: string | undefined, address: string): Pr
   });
 }
 
-async function pushSnapshot(tctx: ToolContext, sheet: string | undefined, address: string) {
+export async function pushSnapshot(tctx: ToolContext, sheet: string | undefined, address: string) {
   // Sheets created in this turn are simply deleted on undo; no need to snapshot them.
   if (sheet && tctx.createdSheets?.has(sheet)) return;
   const op = await snapshotRange(sheet, address);
