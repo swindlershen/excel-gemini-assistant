@@ -195,12 +195,13 @@ export const TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: "read_range",
     description:
-      "读取单元格区域的值和公式。返回 values 二维数组（计算后的值），以及 formulas（仅包含有公式的单元格，键为单元格地址）。大区域会被截断，可分段读取。",
+      "读取单元格区域的计算值（values 二维数组）。默认不返回公式源码以节省 token；仅当需要查看或修改公式时才传 include_formulas=true。大区域会被截断，可分段读取。",
     parameters: {
       type: "OBJECT",
       properties: {
         sheet: SHEET,
         address: S("A1 格式地址，例如 'A1:F50'，也可以是 'Sheet2!B2:D10'。"),
+        include_formulas: B("是否同时返回公式源码，默认 false。仅排查/编辑公式时设为 true。"),
         include_number_format: B("是否同时返回数字格式，默认 false。"),
       },
       required: ["address"],
@@ -419,7 +420,12 @@ export const TOOL_LABELS: Record<string, string> = {
 
 type Args = Record<string, unknown>;
 
-async function readRangeData(sheetName: string | undefined, address: string, includeFormat: boolean) {
+async function readRangeData(
+  sheetName: string | undefined,
+  address: string,
+  includeFormat: boolean,
+  includeFormulas: boolean
+) {
   return Excel.run(async (ctx) => {
     const ws = getSheet(ctx, sheetName);
     let r = ws.getRange(address);
@@ -435,23 +441,26 @@ async function readRangeData(sheetName: string | undefined, address: string, inc
       r = r.getCell(0, 0).getResizedRange(rowsAllowed - 1, colsAllowed - 1);
       truncated = `区域共 ${totalRows} 行 × ${cols} 列，仅返回前 ${rowsAllowed} 行${colsAllowed < cols ? `、前 ${colsAllowed} 列` : ""}。请分段读取剩余部分。`;
     }
-    const props: string[] = ["values", "formulas", "address", "rowIndex", "columnIndex"];
+    const props: string[] = ["values", "address", "rowIndex", "columnIndex"];
+    if (includeFormulas) props.push("formulas");
     if (includeFormat) props.push("numberFormat");
     r.load(props);
     await ctx.sync();
 
-    const formulas: Record<string, string> = {};
-    r.formulas.forEach((row, i) =>
-      row.forEach((f, j) => {
-        if (typeof f === "string" && f.startsWith("=")) formulas[cellName(r.rowIndex + i, r.columnIndex + j)] = f;
-      })
-    );
     const out: Record<string, unknown> = {
       address: fullAddress,
       returned_address: r.address,
       values: r.values.map((row) => row.map(trimValue)),
     };
-    if (Object.keys(formulas).length) out.formulas = formulas;
+    if (includeFormulas) {
+      const formulas: Record<string, string> = {};
+      r.formulas.forEach((row, i) =>
+        row.forEach((f, j) => {
+          if (typeof f === "string" && f.startsWith("=")) formulas[cellName(r.rowIndex + i, r.columnIndex + j)] = f;
+        })
+      );
+      if (Object.keys(formulas).length) out.formulas = formulas;
+    }
     if (includeFormat) out.number_format = r.numberFormat;
     if (truncated) out.note = truncated;
     return out;
@@ -843,7 +852,9 @@ export async function executeTool(name: string, args: Args, tctx: ToolContext): 
       return { response: await getWorkbookInfo() };
     case "read_range": {
       const { sheet, address } = splitAddress(str(args.sheet), String(args.address ?? ""));
-      return { response: await readRangeData(sheet, address, args.include_number_format === true) };
+      return {
+        response: await readRangeData(sheet, address, args.include_number_format === true, args.include_formulas === true),
+      };
     }
     case "get_selection":
       return { response: await getSelectionInfo(MAX_READ_CELLS) };

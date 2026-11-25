@@ -153,3 +153,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); }
 .diff-info { color: var(--text); line-height: 1.45; }
 .diff-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .diff-ok { color: var(--ok); font-weight: 600; }
+.diff-rows { display: flex; flex-direction: column; gap: 4px; margin: 2px 0; }
+.diff-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.diff-row-lbl { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.diff-num { width: 84px; padding: 3px 6px; border: 1px solid #d9b676; border-radius: 5px; font: inherit; text-align: right; background: #fff; }
+.diff-sum { flex: 1; font-size: 11px; color: #9a5b00; }
+.diff-sum.ok { color: var(--ok); font-weight: 600; }

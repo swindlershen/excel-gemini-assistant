@@ -22,6 +22,7 @@ import {
   readPendingOrders,
   summarize,
   updateOrderAmount,
+  updateOrderRows,
   writeInvoices,
 } from "./invoice";
 
@@ -479,7 +480,7 @@ async function runTurn(userText: string, atts: Attachment[] = []) {
       for await (const chunk of streamGenerate({
         apiKey: settings.apiKey,
         model: settings.model,
-        thinkingLevel: settings.thinkingLevel,
+        thinkingLevel: settings.thinkingLevel || (/gemini-(3|4)/.test(settings.model) ? "low" : ""),
         systemInstruction: SYSTEM_PROMPT,
         tools: TOOL_DECLARATIONS,
         contents: history,
@@ -632,8 +633,22 @@ async function runInvoiceTurn(userText: string, atts: Attachment[]) {
     renderMarkdown(md, summary);
     block.appendChild(md);
     if (res.discrepancies?.length) renderDiscrepancies(block, res.discrepancies);
-    // Give the chat model a compact text record (no images) for follow-up questions.
-    pushUser([{ text: `[系统记录] 用户通过“扫描发票”录入了发票，结果如下：\n${summary}\n识别数据：${JSON.stringify(r.invoices)}` }]);
+    // Give the chat model a compact text record (with exact discrepancy cell coords) for follow-up corrections.
+    const diffNote = res.discrepancies?.length
+      ? `\n金额差异明细（如需用户口头修改可直接定位单元格，无需重读整表）：\n` +
+        res.discrepancies
+          .map(
+            (d) =>
+              `- 订单 ${d.orderNo}（采购合计 ${d.orderAmount} vs 已收票 ${d.invoicedAmount}）：` +
+              d.items.map((it) => `${d.orderSheet}!${d.costCol}${it.row} 序号${it.seq} ${it.name} 当前=${it.cost}`).join("；")
+          )
+          .join("\n")
+      : "";
+    pushUser([
+      {
+        text: `[系统记录] 用户通过“扫描发票”录入了发票，结果如下：\n${summary}${diffNote}\n识别数据：${JSON.stringify(r.invoices)}`,
+      },
+    ]);
     history.push({ role: "model", parts: [{ text: "已记录。" }] });
   } catch (e) {
     if ((e as Error).name === "AbortError") addError(block, "已停止。");
@@ -712,6 +727,83 @@ function renderDiscrepancies(block: HTMLElement, list: OrderDiscrepancy[]) {
         }
       };
       actions.appendChild(btn);
+    } else if (d.items.length > 1 && d.items.length <= 10) {
+      const editor = el("div", "diff-rows");
+      const inputs: { row: number; orig: number; input: HTMLInputElement }[] = [];
+      for (const it of d.items) {
+        const rowEl = el("div", "diff-row");
+        const lbl = el("span", "diff-row-lbl", `序号${it.seq} ${it.name || `第${it.row}行`}`);
+        lbl.title = `${d.orderSheet}!${d.costCol}${it.row} ${it.name}`;
+        const inp = el("input", "diff-num") as HTMLInputElement;
+        inp.type = "number";
+        inp.step = "0.01";
+        inp.value = String(it.cost);
+        inputs.push({ row: it.row, orig: it.cost, input: inp });
+        rowEl.append(lbl, inp);
+        editor.appendChild(rowEl);
+      }
+      card.appendChild(editor);
+
+      const sumEl = el("span", "diff-sum");
+      const updateSum = () => {
+        const s = inputs.reduce((acc, x) => acc + (Number(x.input.value) || 0), 0);
+        const delta = s - d.invoicedAmount;
+        sumEl.textContent =
+          Math.abs(delta) < 0.005
+            ? `合计 ${fmt(s)}（与发票一致 ✓）`
+            : `合计 ${fmt(s)}（距发票差 ${delta > 0 ? "+" : ""}${fmt(delta)}）`;
+        sumEl.className = Math.abs(delta) < 0.005 ? "diff-sum ok" : "diff-sum";
+      };
+      inputs.forEach((x) => x.input.addEventListener("input", updateSum));
+      updateSum();
+
+      const saveBtn = el("button", "primary-btn small", "保存修改（免AI费用）");
+      saveBtn.onclick = async () => {
+        const updates = inputs
+          .map((x) => ({ row: x.row, cost: Number(x.input.value), orig: x.orig }))
+          .filter((x) => isFinite(x.cost) && Math.abs(x.cost - x.orig) >= 0.0001);
+        if (!updates.length) {
+          sumEl.textContent = "未修改任何金额";
+          return;
+        }
+        saveBtn.disabled = true;
+        saveBtn.textContent = "保存中…";
+        try {
+          const { status, undo } = await updateOrderRows(
+            d,
+            updates.map((u) => ({ row: u.row, cost: u.cost }))
+          );
+          inputs.forEach((x) => (x.input.disabled = true));
+          actions.innerHTML = "";
+          actions.appendChild(
+            el("span", "diff-ok", `✓ 已更新 ${updates.length} 行${status ? `（${status}）` : ""}`)
+          );
+          const undoBtn = el("button", "small-btn", "↶ 撤销此修改");
+          undoBtn.onclick = async () => {
+            undoBtn.disabled = true;
+            try {
+              await undo();
+              inputs.forEach((x) => {
+                x.input.disabled = false;
+                x.input.value = String(x.orig);
+              });
+              updateSum();
+              actions.innerHTML = "";
+              saveBtn.disabled = false;
+              saveBtn.textContent = "保存修改（免AI费用）";
+              actions.append(sumEl, saveBtn);
+            } catch (err) {
+              undoBtn.disabled = false;
+              undoBtn.textContent = `撤销失败：${(err as Error).message}`;
+            }
+          };
+          actions.appendChild(undoBtn);
+        } catch (err) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = `保存失败，重试（${(err as Error).message}）`;
+        }
+      };
+      actions.append(sumEl, saveBtn);
     } else {
       actions.appendChild(
         el("span", "hint", `该订单包含 ${d.orderSheetRows.length} 个产品行（可能是分批开票），请点右上角地址手动核对。`)

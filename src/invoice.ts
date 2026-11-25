@@ -424,11 +424,19 @@ export interface WrittenRowSummary {
   note: string;
 }
 
+export interface OrderRowItem {
+  row: number; // 1-based Excel row in 采购订单
+  seq: string;
+  name: string;
+  cost: number;
+}
+
 export interface OrderDiscrepancy {
   orderNo: string;
   orderKey: string;
   orderSheet: string;
   orderSheetRows: number[]; // 1-based Excel rows in 采购订单
+  items: OrderRowItem[];
   costCol: string; // e.g. "I"
   statusCol: string; // e.g. "N"
   itemSummary: string;
@@ -653,7 +661,8 @@ async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrep
       {
         orderNo: string;
         rows: number[];
-        items: string[];
+        items: OrderRowItem[];
+        labels: string[];
         orderAmount: number;
         invoicedAmount: number;
         diff: number;
@@ -667,8 +676,10 @@ async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrep
       if (!key || !keySet.has(key)) continue;
       const excelRow = used.rowIndex + i + 1;
       const seq = cSeq >= 0 ? String(row[cSeq] ?? "").trim() : "";
-      const item = cItem >= 0 ? String(row[cItem] ?? "").trim() : "";
-      const label = [seq ? `序号${seq}` : "", item].filter(Boolean).join(" ");
+      const name = cItem >= 0 ? String(row[cItem] ?? "").trim() : "";
+      const rowCost = Number(row[cCost]);
+      const itemObj: OrderRowItem = { row: excelRow, seq, name, cost: isFinite(rowCost) ? rowCost : 0 };
+      const label = [seq ? `序号${seq}` : "", name].filter(Boolean).join(" ");
       const orderNo = cOrder >= 0 ? String(row[cOrder] ?? "").trim() : "";
       const orderAmount = Number(cOrdTotal >= 0 ? row[cOrdTotal] : row[cCost]);
       const invoicedAmount = Number(cInvTotal >= 0 ? row[cInvTotal] : 0);
@@ -678,12 +689,14 @@ async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrep
       const g = groups.get(key);
       if (g) {
         g.rows.push(excelRow);
-        if (label) g.items.push(label);
+        g.items.push(itemObj);
+        if (label) g.labels.push(label);
       } else {
         groups.set(key, {
           orderNo,
           rows: [excelRow],
-          items: label ? [label] : [],
+          items: [itemObj],
+          labels: label ? [label] : [],
           orderAmount: isFinite(orderAmount) ? orderAmount : 0,
           invoicedAmount: isFinite(invoicedAmount) ? invoicedAmount : 0,
           diff: isFinite(diff) ? diff : 0,
@@ -702,9 +715,10 @@ async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrep
           orderKey,
           orderSheet: ORDER_SHEET,
           orderSheetRows: g.rows,
+          items: g.items,
           costCol,
           statusCol,
-          itemSummary: g.items.slice(0, 2).join("；") + (g.items.length > 2 ? ` 等${g.items.length}项` : ""),
+          itemSummary: g.labels.slice(0, 2).join("；") + (g.labels.length > 2 ? ` 等${g.labels.length}项` : ""),
           orderAmount: g.orderAmount,
           invoicedAmount: g.invoicedAmount,
           diff: g.diff,
@@ -716,40 +730,47 @@ async function findOrderDiscrepancies(orderKeys: string[]): Promise<OrderDiscrep
   });
 }
 
-/** One-click update of a single-row purchase order's 含税成本 to match the invoice amount, with undo. */
-export async function updateOrderAmount(
-  d: OrderDiscrepancy
+/** Updates one or more rows' 含税成本 in 「采购订单」 directly via Office.js (0 API calls), with undo. */
+export async function updateOrderRows(
+  d: OrderDiscrepancy,
+  updates: { row: number; cost: number }[]
 ): Promise<{ status: string; undo: () => Promise<void> }> {
-  if (d.orderSheetRows.length !== 1) throw new Error("该订单包含多行产品，请手动核对修改。");
-  const row = d.orderSheetRows[0];
-  const addr = `${d.costCol}${row}`;
-  const { oldVal, newStatus } = await Excel.run(async (ctx) => {
+  if (!updates.length) throw new Error("没有需要修改的行。");
+  const { prevList, newStatus } = await Excel.run(async (ctx) => {
     const ws = ctx.workbook.worksheets.getItem(d.orderSheet);
-    const rg = ws.getRange(addr);
-    rg.load("formulas");
+    const ranges = updates.map((u) => {
+      const rg = ws.getRange(`${d.costCol}${u.row}`);
+      rg.load("formulas");
+      return { u, rg };
+    });
     await ctx.sync();
-    const prev = rg.formulas;
-    rg.formulas = [[d.invoicedAmount]];
+    const prev = ranges.map(({ u, rg }) => ({ addr: `${d.costCol}${u.row}`, formulas: rg.formulas }));
+    for (const { u, rg } of ranges) rg.formulas = [[u.cost]];
     ws.activate();
-    rg.select();
+    ranges[0].rg.select();
     await ctx.sync();
     let st = "";
     if (d.statusCol) {
-      const sr = ws.getRange(`${d.statusCol}${row}`);
+      const sr = ws.getRange(`${d.statusCol}${updates[0].row}`);
       sr.load("values");
       await ctx.sync();
       st = String(sr.values[0][0] ?? "");
     }
-    return { oldVal: prev, newStatus: st };
+    return { prevList: prev, newStatus: st };
   });
   const undo = async () => {
     await Excel.run(async (ctx) => {
       const ws = ctx.workbook.worksheets.getItem(d.orderSheet);
-      ws.getRange(addr).formulas = oldVal;
+      for (const p of prevList) ws.getRange(p.addr).formulas = p.formulas;
       await ctx.sync();
     });
   };
   return { status: newStatus, undo };
+}
+
+export async function updateOrderAmount(d: OrderDiscrepancy) {
+  if (d.orderSheetRows.length !== 1) throw new Error("该订单包含多行产品，请逐行调整后保存。");
+  return updateOrderRows(d, [{ row: d.orderSheetRows[0], cost: d.invoicedAmount }]);
 }
 
 async function writeGenericInvoices(

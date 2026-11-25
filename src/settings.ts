@@ -13,7 +13,7 @@ export const PRESET_MODELS: { id: string; label: string }[] = [
 ];
 
 export const THINKING_LEVELS = [
-  { id: "", label: "默认" },
+  { id: "", label: "自动（低思考，省费推荐）" },
   { id: "low", label: "低" },
   { id: "medium", label: "中" },
   { id: "high", label: "高" },
