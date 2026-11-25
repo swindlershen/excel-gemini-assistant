@@ -59,7 +59,7 @@ export interface PendingOrder {
 interface TemplateLayout {
   mode: "project";
   headerRow: number; // 0-based
-  firstBlankRow: number; // 0-based
+  blankRows: number[]; // 0-based empty data rows in ascending order
   maxRow: number; // 0-based inclusive
   existingNumbers: Set<string>;
   cols: {
@@ -212,28 +212,25 @@ export async function inspectInvoiceSheet(): Promise<SheetLayout> {
       const maxRow = used.rowIndex + used.rowCount - 1;
       const numRows = Math.max(0, maxRow - dataStart + 1);
       const existingNumbers = new Set<string>();
-      let firstBlankRow = dataStart;
+      const blankRows: number[] = [];
 
       if (numRows > 0) {
-        // Read only col A (number) and col D (order) to find existing invoice numbers & first blank row.
-        const aRange = ws.getRangeByIndexes(dataStart, cols.number, numRows, 1);
-        const dRange = ws.getRangeByIndexes(dataStart, cols.order, numRows, 1);
-        aRange.load("values");
-        dRange.load("values");
+        // Check input columns (A 票号, D 订单号, G 整张票金额, H 分配额) so a row with any data is never overwritten.
+        const checkCols = [cols.number, cols.order, cols.total, cols.alloc].filter((c) => c >= 0);
+        const ranges = checkCols.map((c) => {
+          const rg = ws.getRangeByIndexes(dataStart, c, numRows, 1);
+          rg.load("values");
+          return rg;
+        });
         await ctx.sync();
-        let foundBlank = false;
         for (let i = 0; i < numRows; i++) {
-          const a = String(aRange.values[i][0] ?? "").trim();
-          const d = String(dRange.values[i][0] ?? "").trim();
+          const a = String(ranges[0].values[i][0] ?? "").trim();
           if (a) existingNumbers.add(a);
-          if (!foundBlank && !a && !d) {
-            firstBlankRow = dataStart + i;
-            foundBlank = true;
-          }
+          const isEmpty = ranges.every((rg) => String(rg.values[i][0] ?? "").trim() === "");
+          if (isEmpty) blankRows.push(dataStart + i);
         }
-        if (!foundBlank) firstBlankRow = maxRow + 1;
       }
-      return { mode: "project", headerRow, firstBlankRow, maxRow, existingNumbers, cols };
+      return { mode: "project", headerRow, blankRows, maxRow, existingNumbers, cols };
     }
 
     // Generic mode fallback
@@ -487,54 +484,81 @@ async function writeProjectInvoices(
 
   if (!toWrite.length) return { sheet: INVOICE_SHEET, address: null, rows: [], duplicates, created: false };
 
-  const startRow = layout.firstBlankRow; // 0-based
-  const count = toWrite.length;
+  // Assign each row to the nearest blank row (falling back to maxRow + 1 only if template rows are all full).
+  let overflow = 0;
+  const targetRows = toWrite.map((_, i) =>
+    i < layout.blankRows.length ? layout.blankRows[i] : layout.maxRow + 1 + overflow++
+  );
   const { cols } = layout;
 
-  // Snapshot only the input columns we are going to touch, preserving every formula column.
-  const colWrites: { col: number; values: (string | number)[][] }[] = [
-    { col: cols.number, values: toWrite.map((r) => [txt(r.inv.invoice_number)]) },
-    { col: cols.date, values: toWrite.map((r) => [dateToExcelSerial(r.inv.issue_date)]) },
-    { col: cols.order, values: toWrite.map((r) => [txt(r.orderNo)]) },
-    { col: cols.total, values: toWrite.map((r) => [r.total]) },
-    { col: cols.alloc, values: toWrite.map((r) => [r.alloc]) },
-    { col: cols.note, values: toWrite.map((r) => [r.note]) },
-  ];
-  if (cols.platform >= 0 && toWrite.some((r) => r.platform))
-    colWrites.push({ col: cols.platform, values: toWrite.map((r) => [r.platform]) });
-  if (cols.ticketType >= 0 && toWrite.some((r) => r.ticketType))
-    colWrites.push({ col: cols.ticketType, values: toWrite.map((r) => [r.ticketType]) });
+  // Group consecutive target rows into contiguous chunks (usually just 1 chunk).
+  const chunks: { startRow: number; indices: number[] }[] = [];
+  targetRows.forEach((rowIdx, i) => {
+    const prev = chunks[chunks.length - 1];
+    if (prev && prev.startRow + prev.indices.length === rowIdx) prev.indices.push(i);
+    else chunks.push({ startRow: rowIdx, indices: [i] });
+  });
 
-  for (const cw of colWrites) {
-    if (cw.col < 0) continue;
-    const L = colLetter(cw.col);
-    const addr = `${L}${startRow + 1}:${L}${startRow + count}`;
-    await pushSnapshot(tctx, INVOICE_SHEET, addr);
+  const buildColWrites = (indices: number[]) => {
+    const sub = indices.map((i) => toWrite[i]);
+    const list: { col: number; values: (string | number)[][] }[] = [
+      { col: cols.number, values: sub.map((r) => [txt(r.inv.invoice_number)]) },
+      { col: cols.date, values: sub.map((r) => [dateToExcelSerial(r.inv.issue_date)]) },
+      { col: cols.order, values: sub.map((r) => [txt(r.orderNo)]) },
+      { col: cols.total, values: sub.map((r) => [r.total]) },
+      { col: cols.alloc, values: sub.map((r) => [r.alloc]) },
+      { col: cols.note, values: sub.map((r) => [r.note]) },
+    ];
+    if (cols.platform >= 0 && sub.some((r) => r.platform))
+      list.push({ col: cols.platform, values: sub.map((r) => [r.platform]) });
+    if (cols.ticketType >= 0 && sub.some((r) => r.ticketType))
+      list.push({ col: cols.ticketType, values: sub.map((r) => [r.ticketType]) });
+    return list;
+  };
+
+  for (const ch of chunks) {
+    for (const cw of buildColWrites(ch.indices)) {
+      if (cw.col < 0) continue;
+      const L = colLetter(cw.col);
+      const addr = `${L}${ch.startRow + 1}:${L}${ch.startRow + ch.indices.length}`;
+      await pushSnapshot(tctx, INVOICE_SHEET, addr);
+    }
   }
 
   const checkStatuses = await Excel.run(async (ctx) => {
     const ws = ctx.workbook.worksheets.getItem(INVOICE_SHEET);
-    for (const cw of colWrites) {
-      if (cw.col < 0) continue;
-      const rg = ws.getRangeByIndexes(startRow, cw.col, count, 1);
-      rg.formulas = cw.values as any;
+    for (const ch of chunks) {
+      for (const cw of buildColWrites(ch.indices)) {
+        if (cw.col < 0) continue;
+        const rg = ws.getRangeByIndexes(ch.startRow, cw.col, ch.indices.length, 1);
+        rg.formulas = cw.values as any;
+      }
     }
-    const sel = ws.getRangeByIndexes(startRow, cols.number, count, Math.max(1, cols.note - cols.number + 1));
+    const lastCh = chunks[chunks.length - 1];
+    const sel = ws.getRangeByIndexes(
+      lastCh.startRow,
+      cols.number,
+      lastCh.indices.length,
+      Math.max(1, cols.note - cols.number + 1)
+    );
     ws.activate();
     sel.select();
     await ctx.sync();
 
     if (cols.check >= 0) {
-      const ck = ws.getRangeByIndexes(startRow, cols.check, count, 1);
-      ck.load("values");
+      const ckRanges = chunks.map((ch) => {
+        const ck = ws.getRangeByIndexes(ch.startRow, cols.check, ch.indices.length, 1);
+        ck.load("values");
+        return ck;
+      });
       await ctx.sync();
-      return ck.values.map((r) => String(r[0] ?? ""));
+      return ckRanges.flatMap((ck) => ck.values.map((r) => String(r[0] ?? "")));
     }
     return toWrite.map(() => "");
   });
 
   const rows: WrittenRowSummary[] = toWrite.map((r, i) => ({
-    rowNum: startRow + i + 1,
+    rowNum: targetRows[i] + 1,
     invoiceNumber: r.inv.invoice_number ?? "—",
     seller: r.inv.seller_name ?? "—",
     orderNo: r.orderNo || "（未匹配）",
@@ -542,7 +566,10 @@ async function writeProjectInvoices(
     checkStatus: checkStatuses[i] || "",
     note: r.inv.note ?? "",
   }));
-  const address = `第 ${startRow + 1}${count > 1 ? `～${startRow + count}` : ""} 行`;
+  const address =
+    chunks.length === 1
+      ? `第 ${targetRows[0] + 1}${targetRows.length > 1 ? `～${targetRows[targetRows.length - 1] + 1}` : ""} 行`
+      : `第 ${targetRows.map((r) => r + 1).join("、")} 行`;
   return { sheet: INVOICE_SHEET, address, rows, duplicates, created: false };
 }
 
